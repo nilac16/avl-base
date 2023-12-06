@@ -27,12 +27,19 @@ typedef int avl_cmpfn_t(const struct avl *n1, const struct avl *n2);
  *  @param node
  *      Double-pointer to the node in the tree that compares equal to @p join.
  *      You can safely overwrite the pointer to @p node with @p join if you want
- *      to, but be sure to free(3) *node afterwards if you need to
+ *      to, but be sure to free(3) *node afterwards if you need to. If you do
+ *      move @p join into @p node's place, remember to copy its topological
+ *      information over to @p join first, i.e.
+ *      @code
+ *         *join = **node;
+ *         *node = join;
+ *         free(original_join_address);
+ *      @endcode
+ *      or your equivalent
  *  @param join
  *      The node being inserted that was found to be equal to @p node. Note that
  *      it is safe (and generally expected) to free(3) this node from this
- *      function in all contexts (the union function will leak its memory
- *      otherwise)
+ *      function in all contexts
  */
 typedef void avl_joinfn_t(struct avl **node, struct avl *join);
 
@@ -125,7 +132,7 @@ typedef enum {
     AVL_POSTORDER   /* Callback is invoked after traveling to the children */
 } avl_iterdir_t;
 
- 
+
 /** @brief Iterate over the tree
  *  @param root
  *      Tree root
