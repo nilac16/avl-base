@@ -1,7 +1,8 @@
-#include <limits.h>
+#include <assert.h>
 #include <setjmp.h>
+#include <stdarg.h>
+#include <stddef.h>
 #include <stdio.h>
-#include <stdlib.h>
 #include "avl.h"
 
 
@@ -19,22 +20,22 @@ static signed char avl_max(signed char x, signed char y)
  *  @param root
  *      Pointer to pointer to root node to rotate
  *  @param dir
- *      Direction to rotate
+ *      Direction to rotate: 0 for a left rotation, 1 for a right
  */
 static void avl_rotate(struct avl **root, avl_dir_t dir)
 {
-    struct avl *base = *root, *side, *swing;
+    struct avl *A = *root, *B, *y;
     signed char chg;
 
-    side = base->next[!dir];
-    swing = side->next[dir];
-    base->next[!dir] = swing;
-    side->next[dir] = base;
-    *root = side;
-    chg = avl_max(dir ? -side->balance : side->balance, 0) + 1;
-    base->balance += dir ? chg : -chg;
-    chg = avl_max(dir ? base->balance : -base->balance, 0) + 1;
-    side->balance += dir ? chg : -chg;
+    B = A->next[!dir];
+    y = B->next[dir];
+    *root = B;
+    A->next[!dir] = y;
+    B->next[dir] = A;
+    chg = avl_max(dir ? -B->balance : B->balance, 0) + 1;
+    A->balance += dir ? chg : -chg;
+    chg = avl_max(dir ? A->balance : -A->balance, 0) + 1;
+    B->balance += dir ? chg : -chg;
 }
 
 
@@ -55,26 +56,24 @@ static int avl_double_rot(signed char rbal, signed char cbal)
 }
 
 
-/** @brief Check the balance of @p root and rotate it if it needs correcting
+/** @brief Restructure @p root if needed to restore the AVL property after an
+ *      insertion
  *  @param root
  *      Address of the pointer to the root node
- *  @note This function only applies standard rotations used during insertion
- *      and deletion. It will not magically rebalance a non-AVL tree
  */
-static void avl_balance_check(struct avl **root)
+static void avl_restructure(struct avl **root)
 {
     signed char bal = (*root)->balance, bal2;
     avl_dir_t inext;
 
-    if (bal > -2 && bal < 2) {
-        return;
+    if (bal < -1 || bal > 1) {
+        inext = bal < 0 ? 0 : 1;
+        bal2 = (*root)->next[inext]->balance;
+        if (avl_double_rot(bal, bal2)) {
+            avl_rotate(&(*root)->next[inext], inext);
+        }
+        avl_rotate(root, !inext);
     }
-    inext = bal < 0 ? 0 : 1;
-    bal2 = (*root)->next[inext]->balance;
-    if (avl_double_rot(bal, bal2)) {
-        avl_rotate(&(*root)->next[inext], inext);
-    }
-    avl_rotate(root, !inext);
 }
 
 
@@ -82,6 +81,22 @@ struct avl_insctx {
     jmp_buf      env;
     volatile int ret;
 };
+
+
+/** @brief Attempt to restructure @p node and longjmp if the subtree height
+ *      remains unchanged
+ *  @param node
+ *      Node to try rebalancing
+ *  @param ctx
+ *      Deletion context
+ */
+static void avl_insert_commit(struct avl **node, struct avl_insctx *ctx)
+{
+    avl_restructure(node);
+    if (!(*node)->balance) {
+        longjmp(ctx->env, 1);
+    }
+}
 
 
 /** @brief Recursive insertion
@@ -120,10 +135,7 @@ static void avl_insert_thunk(struct avl       **root,
     next = &(*root)->next[cmp < 0 ? 0 : 1];
     avl_insert_thunk(next, node, cmpfn, joinfn, ctx);
     (*root)->balance += cmp < 0 ? -1 : 1;
-    avl_balance_check(root);
-    if (!(*root)->balance) {
-        longjmp(ctx->env, 1);
-    }
+    avl_insert_commit(root, ctx);
 }
 
 
@@ -146,49 +158,69 @@ struct avl_delctx {
 };
 
 
-/** @brief Overwrite @p dst with @p src and move the right child of @p src to
- *      its place
- *  @param root
- *      Overwritten node. The pointer this points to will be LOST
- *  @param succ
- *      Node to overwrite. Its left child pointer will be LOST
- */
-static void avl_overwrite(struct avl **root, struct avl **succ)
-{
-    struct avl *repl = *succ;
-
-    /* Move succ's right child into its place */
-    *succ = (*succ)->next[1];
-    /* Overwrite the AVL part of succ with that of root. This leaves user data
-    intact, but copies root's topological information to succ */
-    *repl = **root;
-    /* Update/overwrite the pointer to root with that to succ, saved earlier */
-    *root = repl;
-}
-
-
-/** @brief Find the successor to @p root and use it to replace @p root
- *  @param root
- *      Root node being replaced
- *  @param succ
- *      Successor search node. Pass this the address of the (nonnull) pointer to
- *      the right child of @p root to start
+/** @brief Attempt to restructure @p node and longjmp if the subtree height
+ *      remains unchanged
+ *  @param node
+ *      Node to try rebalancing
  *  @param ctx
  *      Deletion context
  */
-static void avl_delete_replace(struct avl       **root,
-                               struct avl       **succ,
-                               struct avl_delctx *ctx)
+static void avl_delete_commit(struct avl **node, struct avl_delctx *ctx)
 {
-    if (!(*succ)->next[0]) {
-        avl_overwrite(root, succ);
-        return;
-    }
-    avl_delete_replace(root, &(*succ)->next[0], ctx);
-    (*succ)->balance++;
-    avl_balance_check(succ);
-    if ((*succ)->balance) {
+    avl_restructure(node);
+    if ((*node)->balance) {
         longjmp(ctx->env, 1);
+    }
+}
+
+
+/** @brief Find the minimum node in the tree at @p root and unlink it
+ *  @param root
+ *      Subtree root. This may NOT address a NULL pointer!
+ *  @param ctx
+ *      Deletion context. The unlinked node is placed here on completion, and
+ *      the jmp_buf is used to exit when no more rotations are required
+ */
+static void avl_unlink_min(struct avl **root, struct avl_delctx *ctx)
+{
+    if ((*root)->next[0]) {
+        avl_unlink_min(&(*root)->next[0], ctx);
+        (*root)->balance++;
+        avl_delete_commit(root, ctx);
+    } else {
+        ctx->res = *root;
+        *root = (*root)->next[1];
+    }
+}
+
+
+/** @brief Delete @p root by replacing it with a valid replacement node
+ *  @param root
+ *      Root node to delete
+ *  @param ctx
+ *      Deletion context
+ */
+static void avl_delete_replace(struct avl **root, struct avl_delctx *ctx)
+{
+    struct avl_delctx ctx2;
+
+    if (!(*root)->next[0] || !(*root)->next[1]) {
+        *root = (*root)->next[0] ? (*root)->next[0] : (*root)->next[1];
+    } else {
+        if (!setjmp(ctx2.env)) {
+            avl_unlink_min(&(*root)->next[1], &ctx2);
+            /* Continue unwinding and rebalancing */
+            *ctx2.res = **root;
+            *root = ctx2.res;
+            (*root)->balance--;
+            avl_delete_commit(root, ctx);
+        } else {
+            /* No further rotations are required, but we still must update the
+            pointers */
+            *ctx2.res = **root;
+            *root = ctx2.res;
+            longjmp(ctx->env, 1);
+        }
     }
 }
 
@@ -221,20 +253,12 @@ static void avl_delete_thunk(struct avl       **root,
         if (delfn && !delfn(*root)) {
             longjmp(ctx->env, 1);
         }
-        if (!(*root)->next[1]) {
-            *root = (*root)->next[0];
-            return;
-        }
-        avl_delete_replace(root, &(*root)->next[1], ctx);
-        cmp = 1;
+        avl_delete_replace(root, ctx);
     } else {
         next = &(*root)->next[cmp < 0 ? 0 : 1];
         avl_delete_thunk(next, test, cmpfn, delfn, ctx);
-    }
-    (*root)->balance -= cmp < 0 ? -1 : 1;
-    avl_balance_check(root);
-    if ((*root)->balance) {
-        longjmp(ctx->env, 1);
+        (*root)->balance += cmp < 0 ? 1 : -1;
+        avl_delete_commit(root, ctx);
     }
 }
 
